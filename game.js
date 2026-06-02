@@ -29,6 +29,7 @@ const PUCK_BOUNCE = 0.55;
 const SHOT_SPEED = 12;
 const PASS_SPEED = 8;
 const PICKUP_COOLDOWN_FRAMES = 10;
+const STEAL_CHANCE = 0.03;             // per-frame chance to strip the puck while pressed against the carrier
 
 const PERIOD_SECONDS = 180;
 const PERIODS = 3;
@@ -58,11 +59,27 @@ const state = {
   started: false,
 };
 
-let activePlayerId = null;
+let controlledId = null;
+let possState = 'loose';            // who holds the puck: 'home' | 'away' | 'loose'
 
 // --- Input ---
-const joystick = { dx: 0, dy: 0, touchId: null };
+// Three independent movement sources, merged each frame with priority
+// touch > mouse > keyboard. Keeping them separate stops one source from
+// zeroing out another (the old bug: the keyboard poll wiped the joystick /
+// mouse vector to 0 every frame, so only the keyboard ever worked).
+const input = {
+  touchX: 0, touchY: 0, touchId: null,
+  mouseX: 0, mouseY: 0, mouseDown: false,
+  keyX: 0, keyY: 0,
+};
 const keys = {};
+
+// Direction the controlled skater should move this frame.
+function moveVector() {
+  if (input.touchId !== null) return { x: input.touchX, y: input.touchY };
+  if (input.mouseDown) return { x: input.mouseX, y: input.mouseY };
+  return { x: input.keyX, y: input.keyY };
+}
 
 function setupInput() {
   const joyEl = document.getElementById('joystick');
@@ -73,40 +90,40 @@ function setupInput() {
   let joyRect = null;
   function refreshRect() { joyRect = joyEl.getBoundingClientRect(); }
 
-  function applyJoyVector(clientX, clientY) {
+  // Pointer position -> normalized [-1,1] vector, and move the knob to match.
+  function joyVector(clientX, clientY) {
     if (!joyRect) refreshRect();
     const cx = joyRect.left + joyRect.width / 2;
     const cy = joyRect.top + joyRect.height / 2;
     const dx = clientX - cx;
     const dy = clientY - cy;
     const max = joyRect.width / 2 - 8;
-    const r = Math.min(max, Math.sqrt(dx * dx + dy * dy));
+    const r = Math.min(max, Math.hypot(dx, dy));
     const angle = Math.atan2(dy, dx);
-    const kx = Math.cos(angle) * r;
-    const ky = Math.sin(angle) * r;
-    knob.style.transform = `translate(calc(-50% + ${kx}px), calc(-50% + ${ky}px))`;
-    joystick.dx = Math.cos(angle) * (r / max);
-    joystick.dy = Math.sin(angle) * (r / max);
+    knob.style.transform =
+      `translate(calc(-50% + ${Math.cos(angle) * r}px), calc(-50% + ${Math.sin(angle) * r}px))`;
+    return { x: Math.cos(angle) * (r / max), y: Math.sin(angle) * (r / max) };
   }
 
   function resetKnob() {
-    joystick.dx = 0; joystick.dy = 0;
-    joystick.touchId = null;
     knob.style.transform = 'translate(-50%, -50%)';
   }
 
+  // --- Touch joystick ---
   joyEl.addEventListener('touchstart', e => {
     refreshRect();
     const t = e.changedTouches[0];
-    joystick.touchId = t.identifier;
-    applyJoyVector(t.clientX, t.clientY);
+    input.touchId = t.identifier;
+    const v = joyVector(t.clientX, t.clientY);
+    input.touchX = v.x; input.touchY = v.y;
     e.preventDefault();
   }, { passive: false });
 
   joyEl.addEventListener('touchmove', e => {
     for (const t of e.changedTouches) {
-      if (t.identifier === joystick.touchId) {
-        applyJoyVector(t.clientX, t.clientY);
+      if (t.identifier === input.touchId) {
+        const v = joyVector(t.clientX, t.clientY);
+        input.touchX = v.x; input.touchY = v.y;
         break;
       }
     }
@@ -115,61 +132,67 @@ function setupInput() {
 
   function endTouch(e) {
     for (const t of e.changedTouches) {
-      if (t.identifier === joystick.touchId) resetKnob();
+      if (t.identifier === input.touchId) {
+        input.touchId = null;
+        input.touchX = 0; input.touchY = 0;
+        resetKnob();
+      }
     }
   }
   joyEl.addEventListener('touchend', endTouch);
   joyEl.addEventListener('touchcancel', endTouch);
 
-  // Mouse fallback for desktop debugging via the joystick UI.
-  let mouseDown = false;
+  // --- Mouse joystick (desktop) ---
   joyEl.addEventListener('mousedown', e => {
     refreshRect();
-    mouseDown = true;
-    applyJoyVector(e.clientX, e.clientY);
+    input.mouseDown = true;
+    const v = joyVector(e.clientX, e.clientY);
+    input.mouseX = v.x; input.mouseY = v.y;
     e.preventDefault();
   });
   window.addEventListener('mousemove', e => {
-    if (mouseDown) applyJoyVector(e.clientX, e.clientY);
+    if (!input.mouseDown) return;
+    const v = joyVector(e.clientX, e.clientY);
+    input.mouseX = v.x; input.mouseY = v.y;
   });
   window.addEventListener('mouseup', () => {
-    if (mouseDown) { mouseDown = false; resetKnob(); }
+    if (!input.mouseDown) return;
+    input.mouseDown = false;
+    input.mouseX = 0; input.mouseY = 0;
+    resetKnob();
   });
 
+  // --- Action buttons ---
   function bindButton(el, handler) {
     el.addEventListener('touchstart', e => { e.preventDefault(); handler(); }, { passive: false });
     el.addEventListener('mousedown', e => { e.preventDefault(); handler(); });
   }
   bindButton(shootBtn, tryShoot);
-  bindButton(passBtn, tryPass);
+  bindButton(passBtn, onPass);
 
+  // --- Keyboard ---
   window.addEventListener('keydown', e => {
     keys[e.key.toLowerCase()] = true;
     if (e.key === ' ' || e.key === 'Enter') { tryShoot(); e.preventDefault(); }
-    if (e.key === 'Shift') { tryPass(); e.preventDefault(); }
+    else if (e.key === 'Shift') { onPass(); e.preventDefault(); }
+    else if (e.key === 'Tab' || e.key.toLowerCase() === 'q') { switchPlayer(); e.preventDefault(); }
   });
   window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
 
   window.addEventListener('resize', refreshRect);
 }
 
-function readKeyboardInput() {
-  // Keyboard overrides only when joystick isn't being dragged.
-  if (joystick.touchId !== null) return;
+// Build the keyboard movement vector. Writes ONLY input.key* — never the
+// touch/mouse fields — so holding no keys can't wipe an active drag.
+function computeKeyVector() {
   let dx = 0, dy = 0;
   if (keys['arrowleft'] || keys['a']) dx -= 1;
   if (keys['arrowright'] || keys['d']) dx += 1;
   if (keys['arrowup'] || keys['w']) dy -= 1;
   if (keys['arrowdown'] || keys['s']) dy += 1;
   const len = Math.hypot(dx, dy);
-  if (len > 0) {
-    joystick.dx = dx / len;
-    joystick.dy = dy / len;
-  } else if (joystick.touchId === null) {
-    // Only zero if not actively touch-driven this frame.
-    joystick.dx = 0;
-    joystick.dy = 0;
-  }
+  if (len > 0) { input.keyX = dx / len; input.keyY = dy / len; }
+  else { input.keyX = 0; input.keyY = 0; }
 }
 
 // --- Helpers ---
@@ -258,19 +281,50 @@ function makePlayers() {
   state.players = players;
 }
 
-// --- Active player selection ---
-function pickActivePlayer() {
-  if (state.puck.ownerId) {
-    const owner = getPlayer(state.puck.ownerId);
-    if (owner && owner.team === 'home' && !owner.isGoalie) return owner.id;
+// --- Controlled player selection (sticky) ---
+function nearestHomeSkaterToPuck() {
+  const n = nearestTo(state.puck, homeSkaters());
+  return n ? n.id : null;
+}
+
+// Decide which home skater the human drives this frame. The key property is
+// that it does NOT thrash: control only moves on meaningful events, never just
+// because some other skater drifted closer to the puck.
+function updateControlledPlayer() {
+  const owner = state.puck.ownerId ? getPlayer(state.puck.ownerId) : null;
+  const newPoss = owner ? owner.team : 'loose';
+  const turnover = newPoss !== possState;     // possession changed hands this frame
+  possState = newPoss;
+
+  // Offense: you always control the home skater carrying the puck.
+  if (owner && owner.team === 'home' && !owner.isGoalie) {
+    controlledId = owner.id;
+    return;
   }
-  const nearest = nearestTo(state.puck, homeSkaters());
-  return nearest ? nearest.id : null;
+
+  // Defense / loose puck: stay on the same skater so movement is predictable.
+  // Re-target the skater nearest the puck only when possession just changed
+  // (so you grab a sensible defender right when you lose the puck) or if the
+  // current pick became invalid. Otherwise the player switches on demand.
+  const cur = controlledId ? getPlayer(controlledId) : null;
+  const validCur = cur && cur.team === 'home' && !cur.isGoalie;
+  if (turnover || !validCur) {
+    controlledId = nearestHomeSkaterToPuck();
+  }
+}
+
+// Manual switch (PASS with no puck, or Q / Tab): jump to the home skater
+// nearest the puck, skipping the one already controlled.
+function switchPlayer() {
+  if (!state.started || state.gameOver) return;
+  const others = homeSkaters().filter(p => p.id !== controlledId);
+  const target = nearestTo(state.puck, others.length ? others : homeSkaters());
+  if (target) controlledId = target.id;
 }
 
 // --- Player movement / AI ---
 function updatePlayers() {
-  activePlayerId = pickActivePlayer();
+  updateControlledPlayer();
   const puck = state.puck;
   const ownerId = puck.ownerId;
   const owner = ownerId ? getPlayer(ownerId) : null;
@@ -278,10 +332,11 @@ function updatePlayers() {
   for (const p of state.players) {
     if (p.isGoalie) { updateGoalie(p); continue; }
 
-    if (p.id === activePlayerId) {
+    if (p.id === controlledId) {
       // Human controlled
-      p.vx = joystick.dx * PLAYER_SPEED;
-      p.vy = joystick.dy * PLAYER_SPEED;
+      const mv = moveVector();
+      p.vx = mv.x * PLAYER_SPEED;
+      p.vy = mv.y * PLAYER_SPEED;
     } else {
       computeAIVelocity(p, owner);
     }
@@ -408,24 +463,45 @@ function updatePuck() {
 
   if (puck.ownerId) {
     const owner = getPlayer(puck.ownerId);
-    if (owner) {
-      // Carry puck just in front of player, based on velocity direction or facing.
-      const moving = Math.hypot(owner.vx, owner.vy);
-      let dirX, dirY;
-      if (moving > 0.2) {
-        dirX = owner.vx / moving;
-        dirY = owner.vy / moving;
-      } else {
-        // Face toward opposing net if idle.
-        dirX = owner.team === 'home' ? 1 : -1;
-        dirY = 0;
+    if (!owner) {
+      puck.ownerId = null;
+    } else {
+      // Body-check steal: an opposing skater pressed against the carrier can
+      // knock the puck loose, so you can actually win it back on defense.
+      if (puck.pickupCD === 0) {
+        for (const p of state.players) {
+          if (p.isGoalie || p.team === owner.team) continue;
+          if (dist(p, owner) < PLAYER_R * 2 + 2 && Math.random() < STEAL_CHANCE) {
+            const ang = Math.atan2(owner.y - p.y, owner.x - p.x);
+            puck.ownerId = null;
+            puck.x = owner.x; puck.y = owner.y;
+            puck.vx = Math.cos(ang) * 3.2 + (Math.random() - 0.5) * 2;
+            puck.vy = Math.sin(ang) * 3.2 + (Math.random() - 0.5) * 2;
+            puck.pickupCD = 8;   // brief window so it doesn't instantly re-stick
+            break;
+          }
+        }
       }
-      const off = PLAYER_R + 4;
-      puck.x = owner.x + dirX * off;
-      puck.y = owner.y + dirY * off;
-      puck.vx = 0; puck.vy = 0;
+      if (puck.ownerId) {
+        // Carry puck just in front of player, based on velocity direction or facing.
+        const moving = Math.hypot(owner.vx, owner.vy);
+        let dirX, dirY;
+        if (moving > 0.2) {
+          dirX = owner.vx / moving;
+          dirY = owner.vy / moving;
+        } else {
+          // Face toward opposing net if idle.
+          dirX = owner.team === 'home' ? 1 : -1;
+          dirY = 0;
+        }
+        const off = PLAYER_R + 4;
+        puck.x = owner.x + dirX * off;
+        puck.y = owner.y + dirY * off;
+        puck.vx = 0; puck.vy = 0;
+        return;
+      }
+      // else: stolen this frame — fall through to loose-puck physics below.
     }
-    return;
   }
 
   // Free puck
@@ -499,7 +575,7 @@ function rightFaceoff(y) {
 // --- Actions ---
 function tryShoot() {
   if (!state.started || state.gameOver || state.faceoffTimer > 0) return;
-  const active = getPlayer(activePlayerId);
+  const active = getPlayer(controlledId);
   if (!active) return;
   if (state.puck.ownerId !== active.id) return;
   const targetX = RIGHT_GOAL_LINE_X + 10;
@@ -507,9 +583,16 @@ function tryShoot() {
   shootPuck(targetX, targetY, SHOT_SPEED);
 }
 
+// PASS button / Shift: pass when carrying, otherwise switch controlled skater.
+function onPass() {
+  const c = getPlayer(controlledId);
+  if (c && state.puck.ownerId === c.id) tryPass();
+  else switchPlayer();
+}
+
 function tryPass() {
   if (!state.started || state.gameOver || state.faceoffTimer > 0) return;
-  const active = getPlayer(activePlayerId);
+  const active = getPlayer(controlledId);
   if (!active) return;
   if (state.puck.ownerId !== active.id) return;
   // Pick best forward teammate; fall back to nearest.
@@ -525,6 +608,10 @@ function tryPass() {
   if (!best) best = nearestTo(active, mates);
   if (!best) return;
   shootPuck(best.x, best.y, PASS_SPEED);
+  // Control follows the pass to the receiver; pin possession state so
+  // updateControlledPlayer doesn't immediately re-target on this turnover.
+  controlledId = best.id;
+  possState = 'loose';
 }
 
 function shootPuck(tx, ty, speed) {
@@ -746,7 +833,7 @@ function drawNet(goalX, isLeft) {
 
 function drawPlayer(p) {
   const team = p.team === 'home' ? HOME : AWAY;
-  const isActive = p.id === activePlayerId;
+  const isActive = p.id === controlledId;
   const body = p.isGoalie ? team.goalie : team.color;
   const dark = p.isGoalie ? team.goalieDark : team.dark;
 
@@ -815,7 +902,7 @@ function updateHUD() {
 
 // --- Main loop ---
 function tick() {
-  readKeyboardInput();
+  computeKeyVector();
 
   if (state.started && !state.gameOver) {
     if (state.faceoffTimer > 0) {
