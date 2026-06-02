@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#0a0a14" />
+  <title>Retro Hockey</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="game-container">
+    <div id="hud">
+      <div id="scoreboard">
+        <span class="team home"><span class="team-name">HOME</span> <span id="home-score">0</span></span>
+        <span class="clock-block">
+          <span id="period">P1</span>
+          <span id="clock">3:00</span>
+        </span>
+        <span class="team away"><span id="away-score">0</span> <span class="team-name">AWAY</span></span>
+      </div>
+    </div>
+
+    <div id="canvas-wrap">
+      <canvas id="game" width="800" height="500"></canvas>
+    </div>
+
+    <div id="controls">
+      <div id="joystick">
+        <div id="joystick-knob"></div>
+      </div>
+      <div id="action-buttons">
+        <button id="pass-btn" class="action-btn">PASS</button>
+        <button id="shoot-btn" class="action-btn">SHOOT</button>
+      </div>
+    </div>
+
+    <div id="splash">
+      <h1>RETRO HOCKEY</h1>
+      <p class="subtitle">5-on-5 arcade hockey</p>
+      <button id="start-btn">START GAME</button>
+      <div class="hint">
+        <p>Mobile: joystick + buttons</p>
+        <p>Keyboard: WASD / arrows, SPACE shoot, SHIFT pass</p>
+      </div>
+    </div>
+  </div>
+  <script src="game.js"></script>
+</body>
+</html>
